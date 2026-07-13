@@ -67,6 +67,14 @@ public class ZEDBodyTrackingManager : MonoBehaviour
         "Use this to reduce popups of avatars in case of partial occlusion/tracked people at the edges of the ZED's frustum.")]
     public float delayBeforeSpawn= 1f;
 
+    [Space(5)]
+    [Header("Persistence (anti-flicker)")]
+    [Tooltip("Seconds to keep an avatar alive after its body id disappears, instead of destroying it instantly. Holds its last pose; resumes if the id returns. 0 = destroy immediately.")]
+    public float lingerBeforeDespawn = 0.75f;
+
+    [Tooltip("When a new body id appears within this distance (m) of a lingering avatar, re-assign that avatar to the new id instead of respawning. 0 = never re-assign.")]
+    public float reassignRadius = 0.6f;
+
 
     [Header("Avatar Control")]
     /// <summary>
@@ -93,6 +101,12 @@ public class ZEDBodyTrackingManager : MonoBehaviour
 
     private Dictionary<int,SkeletonHandler> avatarControlList;
     public Dictionary<int, SkeletonHandler> AvatarControlList { get => avatarControlList;}
+
+    // id -> time it was lost (kept alive until lingerBeforeDespawn elapses), and id -> last world pos.
+    private readonly Dictionary<int, float> pendingDespawn = new Dictionary<int, float>();
+    private readonly Dictionary<int, Vector3> lastBodyWorldPos = new Dictionary<int, Vector3>();
+    private readonly List<int> despawnScratch = new List<int>();
+    private readonly List<DetectedBody> newIdBodies = new List<DetectedBody>();
     public bool EnableSmoothing { get => enableSmoothing; set => enableSmoothing = value; }
     public bool EnableFootIK { get => enableFootIK; set => enableFootIK = value; }
     public bool EnableFootLocking { get => enableFootLocking; set => enableFootLocking = value; }
@@ -235,6 +249,9 @@ public class ZEDBodyTrackingManager : MonoBehaviour
 		List<int> remainingKeyList = new List<int>(avatarControlList.Keys);
 		List<DetectedBody> newbodies = dframe.GetFilteredObjectList(showON, showSEARCHING, showOFF);
 
+		// Pass 1: update avatars still present; collect brand-new ids. Two passes so pass 2 can
+		// adopt avatars dropped in this same frame (same-frame id-swap), not just older ones.
+		newIdBodies.Clear();
  		foreach (DetectedBody dbody in newbodies)
         {
 			int person_id = dbody.rawBodyData.id;
@@ -245,25 +262,108 @@ public class ZEDBodyTrackingManager : MonoBehaviour
 				SkeletonHandler handler = avatarControlList[person_id];
 				UpdateAvatarControl(handler, dbody.rawBodyData);
 
-				// remove keys from list
 				remainingKeyList.Remove(person_id);
+				pendingDespawn.Remove(person_id);
+				lastBodyWorldPos[person_id] = dbody.Get3DWorldPosition();
 			}
 			else
 			{
-                if (avatarControlList.Count < maximumNumberOfDetections)
-                {
-                    StartCoroutine(InstanciateAvatarWithDelay(delayBeforeSpawn, dbody));
-                }
+				newIdBodies.Add(dbody);
 			}
 		}
 
-        foreach (int index in remainingKeyList)
+		// Pass 2: adopt a nearby unmatched avatar for each new id, else spawn fresh. Adopted ids are
+		// pulled from remainingKeyList so two new bodies can't claim the same avatar.
+		for (int b = 0; b < newIdBodies.Count; b++)
 		{
-			SkeletonHandler handler = avatarControlList[index];
-			handler.Destroy();
-			avatarControlList.Remove(index);
+			DetectedBody dbody = newIdBodies[b];
+			int reassignedFrom = TryReassignLingeringAvatar(dbody.rawBodyData.id, dbody, remainingKeyList);
+			if (reassignedFrom >= 0)
+			{
+				remainingKeyList.Remove(reassignedFrom);
+			}
+			else if (avatarControlList.Count < maximumNumberOfDetections)
+			{
+				StartCoroutine(InstanciateAvatarWithDelay(delayBeforeSpawn, dbody));
+			}
+		}
+
+		// Bodies not seen this frame: linger (hold last pose) instead of destroying immediately.
+		foreach (int index in remainingKeyList)
+		{
+			if (lingerBeforeDespawn > 0f)
+			{
+				if (!pendingDespawn.ContainsKey(index))
+					pendingDespawn[index] = Time.realtimeSinceStartup;
+			}
+			else
+			{
+				DespawnAvatarNow(index);
+			}
+		}
+
+		// Destroy lingering avatars whose grace has elapsed.
+		if (pendingDespawn.Count > 0)
+		{
+			despawnScratch.Clear();
+			foreach (var kv in pendingDespawn)
+			{
+				if (Time.realtimeSinceStartup - kv.Value >= lingerBeforeDespawn)
+					despawnScratch.Add(kv.Key);
+			}
+			for (int i = 0; i < despawnScratch.Count; i++)
+				DespawnAvatarNow(despawnScratch[i]);
 		}
     }
+
+	/// <summary>
+	/// Re-key the nearest unmatched avatar within reassignRadius of the new body onto its id (no
+	/// Destroy, no spawn delay). Returns the adopted old id, or -1 if none matched.
+	/// </summary>
+	private int TryReassignLingeringAvatar(int newId, DetectedBody dbody, List<int> candidates)
+	{
+		if (reassignRadius <= 0f || candidates.Count == 0) return -1;
+
+		Vector3 newPos = dbody.Get3DWorldPosition();
+		int bestId = -1;
+		float bestDistSqr = reassignRadius * reassignRadius;
+		for (int i = 0; i < candidates.Count; i++)
+		{
+			int lostId = candidates[i];
+			if (!avatarControlList.ContainsKey(lostId)) continue;
+			if (!lastBodyWorldPos.TryGetValue(lostId, out Vector3 lostPos)) continue;
+			float dSqr = (newPos - lostPos).sqrMagnitude;
+			if (dSqr <= bestDistSqr) { bestDistSqr = dSqr; bestId = lostId; }
+		}
+		if (bestId < 0) return -1;
+
+		SkeletonHandler handler = avatarControlList[bestId];
+		avatarControlList.Remove(bestId);
+		pendingDespawn.Remove(bestId);
+		lastBodyWorldPos.Remove(bestId);
+
+		handler.ID = newId;
+		avatarControlList[newId] = handler;
+		UpdateAvatarControl(handler, dbody.rawBodyData);
+		lastBodyWorldPos[newId] = newPos;
+
+		// Keep it shown immediately (skip the spawn delay); guard refs in case it was mid-spawn.
+		if (handler.GetAnimator() != null) handler.GetAnimator().gameObject.SetActive(true);
+		if (handler.zedSkeletonAnimator != null) handler.zedSkeletonAnimator.canSpawn = true;
+
+		return bestId;
+	}
+
+	private void DespawnAvatarNow(int id)
+	{
+		if (avatarControlList.TryGetValue(id, out SkeletonHandler handler))
+		{
+			handler.Destroy();
+			avatarControlList.Remove(id);
+		}
+		pendingDespawn.Remove(id);
+		lastBodyWorldPos.Remove(id);
+	}
 
 	public void Update()
     {
